@@ -8,10 +8,24 @@
 (define-constant ERR_PROPOSAL_NOT_PASSED (err u106))
 (define-constant ERR_ALREADY_EXECUTED (err u107))
 (define-constant ERR_NOT_MEMBER (err u108))
+(define-constant ERR_INVALID_REIMBURSEMENT (err u109))
+(define-constant ERR_REIMBURSEMENT_NOT_FOUND (err u110))
+(define-constant ERR_ALREADY_REVIEWED (err u111))
+(define-constant ERR_INSUFFICIENT_APPROVALS (err u112))
+(define-constant ERR_REIMBURSEMENT_ALREADY_PROCESSED (err u113))
+(define-constant ERR_CANNOT_REVIEW_OWN_REQUEST (err u114))
+(define-constant ERR_RECURRING_GRANT_NOT_FOUND (err u115))
+(define-constant ERR_INVALID_PERFORMANCE_SCORE (err u116))
+(define-constant ERR_RECURRING_GRANT_PAUSED (err u117))
+(define-constant ERR_NOT_DUE_FOR_PAYMENT (err u118))
+(define-constant ERR_ALREADY_CLAIMED_THIS_PERIOD (err u119))
+(define-constant ERR_INVALID_RECURRING_GRANT (err u120))
 
 (define-data-var proposal-counter uint u0)
+(define-data-var recurring-grant-counter uint u0)
 (define-data-var total-members uint u0)
 (define-data-var treasury-balance uint u0)
+(define-data-var reimbursement-counter uint u0)
 
 (define-map dao-members principal bool)
 (define-map member-voting-power principal uint)
@@ -36,6 +50,37 @@
 (define-map proposal-votes
   { proposal-id: uint, voter: principal }
   { vote: bool, voting-power: uint }
+)
+
+(define-map recurring-grants
+  uint
+  {
+    id: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    recipient: principal,
+    base-amount: uint,
+    payment-interval: uint,
+    max-payments: uint,
+    payments-made: uint,
+    performance-score: uint,
+    performance-threshold: uint,
+    last-payment-block: uint,
+    next-payment-block: uint,
+    creator: principal,
+    active: bool,
+    created-at: uint
+  }
+)
+
+(define-map recurring-grant-claims
+  { grant-id: uint, period: uint }
+  { claimed: bool, claim-block: uint }
+)
+
+(define-map performance-updates
+  { grant-id: uint, updater: principal }
+  { score: uint, updated-at: uint }
 )
 
 (define-public (join-dao)
@@ -208,5 +253,160 @@
       (> (get votes-for proposal) (get votes-against proposal))
       (<= (get amount proposal) (var-get treasury-balance))
     ))
+  )
+)
+
+(define-public (create-recurring-grant
+  (title (string-ascii 100))
+  (description (string-ascii 500))
+  (recipient principal)
+  (base-amount uint)
+  (payment-interval uint)
+  (max-payments uint)
+  (performance-threshold uint)
+)
+  (let (
+    (grant-id (+ (var-get recurring-grant-counter) u1))
+    (caller tx-sender)
+  )
+    (asserts! (is-member caller) ERR_NOT_MEMBER)
+    (asserts! (> base-amount u0) ERR_INVALID_RECURRING_GRANT)
+    (asserts! (> payment-interval u0) ERR_INVALID_RECURRING_GRANT)
+    (asserts! (> max-payments u0) ERR_INVALID_RECURRING_GRANT)
+    (asserts! (<= performance-threshold u100) ERR_INVALID_PERFORMANCE_SCORE)
+    (asserts! (<= (* base-amount max-payments) (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+    
+    (map-set recurring-grants grant-id {
+      id: grant-id,
+      title: title,
+      description: description,
+      recipient: recipient,
+      base-amount: base-amount,
+      payment-interval: payment-interval,
+      max-payments: max-payments,
+      payments-made: u0,
+      performance-score: u100,
+      performance-threshold: performance-threshold,
+      last-payment-block: u0,
+      next-payment-block: (+ stacks-block-height payment-interval),
+      creator: caller,
+      active: true,
+      created-at: stacks-block-height
+    })
+    
+    (var-set recurring-grant-counter grant-id)
+    (ok grant-id)
+  )
+)
+
+(define-public (claim-recurring-payment (grant-id uint))
+  (let (
+    (grant (unwrap! (map-get? recurring-grants grant-id) ERR_RECURRING_GRANT_NOT_FOUND))
+    (current-period (+ (get payments-made grant) u1))
+    (adjusted-amount (/ (* (get base-amount grant) (get performance-score grant)) u100))
+  )
+    (asserts! (get active grant) ERR_RECURRING_GRANT_PAUSED)
+    (asserts! (>= stacks-block-height (get next-payment-block grant)) ERR_NOT_DUE_FOR_PAYMENT)
+    (asserts! (< (get payments-made grant) (get max-payments grant)) ERR_INVALID_RECURRING_GRANT)
+    (asserts! (>= (get performance-score grant) (get performance-threshold grant)) ERR_INVALID_PERFORMANCE_SCORE)
+    (asserts! (is-none (map-get? recurring-grant-claims { grant-id: grant-id, period: current-period })) ERR_ALREADY_CLAIMED_THIS_PERIOD)
+    (asserts! (<= adjusted-amount (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? adjusted-amount tx-sender (get recipient grant))))
+    
+    (map-set recurring-grant-claims { grant-id: grant-id, period: current-period } 
+      { claimed: true, claim-block: stacks-block-height })
+    
+    (map-set recurring-grants grant-id (merge grant {
+      payments-made: current-period,
+      last-payment-block: stacks-block-height,
+      next-payment-block: (+ stacks-block-height (get payment-interval grant))
+    }))
+    
+    (var-set treasury-balance (- (var-get treasury-balance) adjusted-amount))
+    (ok adjusted-amount)
+  )
+)
+
+(define-public (update-performance-score (grant-id uint) (new-score uint))
+  (let (
+    (grant (unwrap! (map-get? recurring-grants grant-id) ERR_RECURRING_GRANT_NOT_FOUND))
+    (caller tx-sender)
+  )
+    (asserts! (is-member caller) ERR_NOT_MEMBER)
+    (asserts! (<= new-score u100) ERR_INVALID_PERFORMANCE_SCORE)
+    (asserts! (get active grant) ERR_RECURRING_GRANT_PAUSED)
+    
+    (map-set performance-updates { grant-id: grant-id, updater: caller }
+      { score: new-score, updated-at: stacks-block-height })
+    
+    (map-set recurring-grants grant-id (merge grant { performance-score: new-score }))
+    (ok true)
+  )
+)
+
+(define-public (pause-recurring-grant (grant-id uint))
+  (let ((grant (unwrap! (map-get? recurring-grants grant-id) ERR_RECURRING_GRANT_NOT_FOUND)))
+    (asserts! (or 
+      (is-eq tx-sender (get creator grant))
+      (is-eq tx-sender CONTRACT_OWNER)
+    ) ERR_UNAUTHORIZED)
+    
+    (map-set recurring-grants grant-id (merge grant { active: false }))
+    (ok true)
+  )
+)
+
+(define-public (resume-recurring-grant (grant-id uint))
+  (let ((grant (unwrap! (map-get? recurring-grants grant-id) ERR_RECURRING_GRANT_NOT_FOUND)))
+    (asserts! (or 
+      (is-eq tx-sender (get creator grant))
+      (is-eq tx-sender CONTRACT_OWNER)
+    ) ERR_UNAUTHORIZED)
+    
+    (map-set recurring-grants grant-id (merge grant { 
+      active: true,
+      next-payment-block: (+ stacks-block-height (get payment-interval grant))
+    }))
+    (ok true)
+  )
+)
+
+(define-read-only (get-recurring-grant (grant-id uint))
+  (map-get? recurring-grants grant-id)
+)
+
+(define-read-only (get-recurring-grant-claim (grant-id uint) (period uint))
+  (map-get? recurring-grant-claims { grant-id: grant-id, period: period })
+)
+
+(define-read-only (get-performance-update (grant-id uint) (updater principal))
+  (map-get? performance-updates { grant-id: grant-id, updater: updater })
+)
+
+(define-read-only (calculate-adjusted-payment (grant-id uint))
+  (let ((grant (unwrap! (map-get? recurring-grants grant-id) (err u404))))
+    (ok (/ (* (get base-amount grant) (get performance-score grant)) u100))
+  )
+)
+
+(define-read-only (is-payment-due (grant-id uint))
+  (let ((grant (unwrap! (map-get? recurring-grants grant-id) (err u404))))
+    (ok (and
+      (get active grant)
+      (>= stacks-block-height (get next-payment-block grant))
+      (< (get payments-made grant) (get max-payments grant))
+      (>= (get performance-score grant) (get performance-threshold grant))
+    ))
+  )
+)
+
+(define-read-only (get-recurring-grant-counter)
+  (var-get recurring-grant-counter)
+)
+
+(define-read-only (get-grant-payments-remaining (grant-id uint))
+  (let ((grant (unwrap! (map-get? recurring-grants grant-id) (err u404))))
+    (ok (- (get max-payments grant) (get payments-made grant)))
   )
 )
