@@ -20,12 +20,18 @@
 (define-constant ERR_NOT_DUE_FOR_PAYMENT (err u118))
 (define-constant ERR_ALREADY_CLAIMED_THIS_PERIOD (err u119))
 (define-constant ERR_INVALID_RECURRING_GRANT (err u120))
+(define-constant ERR_INVALID_REPUTATION_ACTION (err u121))
+(define-constant ERR_REPUTATION_COOLDOWN_ACTIVE (err u122))
+(define-constant ERR_CANNOT_RATE_OWN_PROPOSAL (err u123))
+(define-constant ERR_INVALID_RATING (err u124))
+(define-constant ERR_ALREADY_RATED (err u125))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var recurring-grant-counter uint u0)
 (define-data-var total-members uint u0)
 (define-data-var treasury-balance uint u0)
 (define-data-var reimbursement-counter uint u0)
+(define-data-var reputation-decay-rate uint u5)
 
 (define-map dao-members principal bool)
 (define-map member-voting-power principal uint)
@@ -83,6 +89,28 @@
   { score: uint, updated-at: uint }
 )
 
+(define-map member-reputation
+  principal
+  {
+    score: uint,
+    total-proposals: uint,
+    successful-proposals: uint,
+    total-votes: uint,
+    last-activity: uint,
+    last-decay: uint
+  }
+)
+
+(define-map proposal-ratings
+  { proposal-id: uint, rater: principal }
+  { rating: uint, rated-at: uint }
+)
+
+(define-map reputation-actions
+  { member: principal, action-type: (string-ascii 20) }
+  { points: uint, last-performed: uint }
+)
+
 (define-public (join-dao)
   (let ((caller tx-sender))
     (if (is-member caller)
@@ -90,6 +118,14 @@
       (begin
         (map-set dao-members caller true)
         (map-set member-voting-power caller u1)
+        (map-set member-reputation caller {
+          score: u100,
+          total-proposals: u0,
+          successful-proposals: u0,
+          total-votes: u0,
+          last-activity: stacks-block-height,
+          last-decay: stacks-block-height
+        })
         (var-set total-members (+ (var-get total-members) u1))
         (ok true)
       )
@@ -135,6 +171,7 @@
     })
     
     (var-set proposal-counter proposal-id)
+    (try! (update-reputation-on-action caller "create-proposal" u10))
     (ok proposal-id)
   )
 )
@@ -163,6 +200,7 @@
       )
     )
     
+    (try! (update-reputation-on-action caller "vote" u5))
     (ok true)
   )
 )
@@ -184,6 +222,7 @@
     (map-set proposals proposal-id (merge proposal { executed: true }))
     (var-set treasury-balance (- (var-get treasury-balance) (get amount proposal)))
     
+    (unwrap-panic (update-reputation-on-successful-proposal (get proposer proposal) u25))
     (ok true)
   )
 )
@@ -410,3 +449,148 @@
     (ok (- (get max-payments grant) (get payments-made grant)))
   )
 )
+
+(define-public (rate-proposal (proposal-id uint) (rating uint))
+  (let (
+    (caller tx-sender)
+    (proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
+  )
+    (asserts! (is-member caller) ERR_NOT_MEMBER)
+    (asserts! (not (is-eq caller (get proposer proposal))) ERR_CANNOT_RATE_OWN_PROPOSAL)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (>= stacks-block-height (get voting-end-block proposal)) ERR_VOTING_ACTIVE)
+    (asserts! (is-none (map-get? proposal-ratings { proposal-id: proposal-id, rater: caller })) ERR_ALREADY_RATED)
+    
+    (map-set proposal-ratings { proposal-id: proposal-id, rater: caller }
+      { rating: rating, rated-at: stacks-block-height })
+    
+    (try! (update-reputation-on-action caller "rate-proposal" u3))
+    (ok true)
+  )
+)
+
+(define-public (apply-reputation-decay (member principal))
+  (let (
+    (reputation (default-to { score: u100, total-proposals: u0, successful-proposals: u0, total-votes: u0, last-activity: u0, last-decay: u0 } 
+                (map-get? member-reputation member)))
+    (blocks-since-decay (- stacks-block-height (get last-decay reputation)))
+    (decay-periods (/ blocks-since-decay u1000))
+    (decay-amount (* decay-periods (var-get reputation-decay-rate)))
+    (new-score (if (> decay-amount (get score reputation)) u0 (- (get score reputation) decay-amount)))
+  )
+    (asserts! (is-member member) ERR_NOT_MEMBER)
+    (asserts! (> decay-periods u0) ERR_INVALID_REPUTATION_ACTION)
+    
+    (map-set member-reputation member (merge reputation {
+      score: new-score,
+      last-decay: stacks-block-height
+    }))
+    
+    (let ((current-voting-power (default-to u0 (map-get? member-voting-power member))))
+      (map-set member-voting-power member (calculate-voting-power-from-reputation new-score))
+    )
+    
+    (ok new-score)
+  )
+)
+
+(define-private (update-reputation-on-action (member principal) (action (string-ascii 20)) (base-points uint))
+  (let (
+    (reputation (default-to { score: u100, total-proposals: u0, successful-proposals: u0, total-votes: u0, last-activity: u0, last-decay: u0 } 
+                (map-get? member-reputation member)))
+    (action-record (map-get? reputation-actions { member: member, action-type: action }))
+    (last-performed (match action-record
+                      record (get last-performed record)
+                      u0))
+    (cooldown-blocks u100)
+  )
+    (asserts! (>= (- stacks-block-height last-performed) cooldown-blocks) ERR_REPUTATION_COOLDOWN_ACTIVE)
+    
+    (map-set reputation-actions { member: member, action-type: action }
+      { points: base-points, last-performed: stacks-block-height })
+    
+    (map-set member-reputation member (merge reputation {
+      score: (+ (get score reputation) base-points),
+      total-votes: (if (is-eq action "vote") (+ (get total-votes reputation) u1) (get total-votes reputation)),
+      total-proposals: (if (is-eq action "create-proposal") (+ (get total-proposals reputation) u1) (get total-proposals reputation)),
+      last-activity: stacks-block-height
+    }))
+    
+    (let ((new-score (+ (get score reputation) base-points)))
+      (map-set member-voting-power member (calculate-voting-power-from-reputation new-score))
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (update-reputation-on-successful-proposal (member principal) (bonus-points uint))
+  (let (
+    (reputation (default-to { score: u100, total-proposals: u0, successful-proposals: u0, total-votes: u0, last-activity: u0, last-decay: u0 } 
+                (map-get? member-reputation member)))
+  )
+    (map-set member-reputation member (merge reputation {
+      score: (+ (get score reputation) bonus-points),
+      successful-proposals: (+ (get successful-proposals reputation) u1),
+      last-activity: stacks-block-height
+    }))
+    
+    (let ((new-score (+ (get score reputation) bonus-points)))
+      (map-set member-voting-power member (calculate-voting-power-from-reputation new-score))
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (calculate-voting-power-from-reputation (reputation-score uint))
+  (if (<= reputation-score u50)
+    u1
+    (if (<= reputation-score u150)
+      u2
+      (if (<= reputation-score u300)
+        u3
+        (if (<= reputation-score u500)
+          u4
+          u5
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-member-reputation (member principal))
+  (map-get? member-reputation member)
+)
+
+(define-read-only (get-proposal-rating (proposal-id uint) (rater principal))
+  (map-get? proposal-ratings { proposal-id: proposal-id, rater: rater })
+)
+
+(define-read-only (get-reputation-action (member principal) (action-type (string-ascii 20)))
+  (map-get? reputation-actions { member: member, action-type: action-type })
+)
+
+(define-read-only (calculate-member-voting-power (member principal))
+  (let ((reputation (map-get? member-reputation member)))
+    (match reputation
+      rep-data (ok (calculate-voting-power-from-reputation (get score rep-data)))
+      (ok u1)
+    )
+  )
+)
+
+(define-read-only (get-reputation-decay-rate)
+  (var-get reputation-decay-rate)
+)
+
+(define-public (set-reputation-decay-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-rate u20) ERR_INVALID_REPUTATION_ACTION)
+    (var-set reputation-decay-rate new-rate)
+    (ok true)
+  )
+)
+
+
